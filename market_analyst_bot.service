@@ -1,0 +1,18 @@
+[Unit]
+Description=Market Analyst Telegram Bot
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/bots/market_analyst_bot
+# Загружаем переменные из .env файла
+EnvironmentFile=/root/bots/market_analyst_bot/.env
+ExecStart=/root/bots/market_analyst_bot/venv/bin/python bot.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/var/log/market_analyst_bot.log
+StandardError=append:/var/log/market_analyst_bot_error.log
+
+[Install]
+WantedBy=multi-user.target
