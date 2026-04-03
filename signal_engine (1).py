@@ -1,27 +1,19 @@
 # ============================================================
-#  signal_engine.py  v3  — prop-grade
+#  signal_engine.py  v4  — prop-grade
 #
-#  Исправлено:
-#  1. PnL считается от stop_price / target_price (не current)
-#  2. Дубли сигналов заблокированы (symbol + direction)
-#  3. avg_rr только по закрытым сигналам
-#  4. quality приведён к единому стандарту: "strong"/"moderate"/"weak"
-#
-#  Новое:
-#  - scan_market_for_best_signal(): скан ТОП-50, возврат 1 лучшего
-#  - calculate_score(): отдельная функция, импортируемая
-#  - filter_signals(): жёсткий фильтр RR / stop_pct / score
-#  - select_best_signal(): сортировка и выбор
-#  - Расширенная статистика: max_drawdown, серия, avg_win/loss
-#  - AI-комментарий (Claude API, опционально)
+#  Исправлено vs v3:
+#  - scan_market_for_best_signal: добавлен 15m для entry layer
+#  - format_signals_block удалён (не использовался) — только format_signal
+#  - _build_scenarios теперь принимает strategy (совместимость с report_generator v5)
+#  - get_best_signals: совместимость с новым _build_scenarios
+#  - Все баги v2 сохранены исправленными (PnL, дубли, avg_rr, quality)
 # ============================================================
 
 from __future__ import annotations
 import json
 import logging
 import asyncio
-import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -31,7 +23,7 @@ import pytz
 from analyzer import FullAnalysis
 from report_generator import (
     _determine_phase, _determine_structure, _get_key_levels,
-    _fmt_price, _parse_price,
+    _build_scenarios, _fmt_price, _parse_price,
 )
 from strategy_selector import select_strategy
 
@@ -40,14 +32,16 @@ TZ = pytz.timezone("Europe/Moscow")
 
 SIGNALS_FILE = Path("/root/bots/market_analyst_bot/signals_history.json")
 
-# ── Фильтры ────────────────────────────────────────────────
-MIN_RR_SCAN    = 2.0    # жёсткий фильтр для сканирования
-MAX_STOP_PCT   = 2.0    # максимальный стоп в %
-MIN_SCORE_SCAN = 5.0    # минимальный балл для сканирования
+MIN_RR_SCAN    = 2.0
+MAX_STOP_PCT   = 2.0
+MIN_SCORE_SCAN = 5.0
+
+# Таймфреймы для сканирования (включая 15m для entry layer)
+SCAN_TIMEFRAMES = ["1D", "4H", "1H", "15m"]
 
 
 # ════════════════════════════════════════════════════════════
-#  Датакласс сигнала
+#  Датакласс
 # ════════════════════════════════════════════════════════════
 
 @dataclass
@@ -55,7 +49,7 @@ class Signal:
     id: str
     symbol: str
     asset_type: str
-    direction: str             # "long" / "short"
+    direction: str
     entry_price: float
     target_price: float
     stop_price: float
@@ -64,27 +58,18 @@ class Signal:
     risk_pct: float
     phase: str
     bias: str
-    strategy: str              # название стратегии
+    strategy: str
     condition: str
-    score: float               # 0-10
+    score: float
     created_at: str
-    status: str = "active"     # active / hit_target / hit_stop / expired
+    status: str = "active"
     closed_at: str = ""
-    result_pct: float = 0.0    # FIX: от stop/target price, не current
-    ai_comment: str = ""       # Claude AI комментарий
+    result_pct: float = 0.0
+    ai_comment: str = ""
 
 
 # ════════════════════════════════════════════════════════════
-#  СКОРИНГ (отдельная публичная функция)
-#
-#  Логика из ТЗ:
-#  тренд совпадает     → +2
-#  BOS/ChoCH           → +1
-#  OB/FVG              → +2
-#  RR ≥ 2              → +2
-#  объём↑              → +1
-#  liquidity sweep     → +1
-#  структура strong    → +1 (бонус)
+#  СКОРИНГ
 # ════════════════════════════════════════════════════════════
 
 def calculate_score(
@@ -97,23 +82,23 @@ def calculate_score(
 ) -> float:
     score = 0.0
 
-    # 1. Тренд совпадает с направлением (+2)
+    # Тренд совпадает (+2)
     bias = structure["bias"]
     if (direction == "long"  and bias == "bullish") or \
        (direction == "short" and bias == "bearish"):
         score += 2.0
 
-    # 2. BOS или ChoCH есть (+1)
+    # BOS/ChoCH (+1)
     if structure.get("bos_desc") or structure.get("choch_desc"):
         score += 1.0
 
-    # 3. OB или FVG в зоне (+2)
+    # OB + FVG confluence (+2) или одно из (+1.5)
     if levels["ob_zones"] and levels["fvg_zones"]:
-        score += 2.0   # confluence → максимум
+        score += 2.0
     elif levels["ob_zones"] or levels["fvg_zones"]:
         score += 1.5
 
-    # 4. R:R (+2 / +1 / +0.5)
+    # R:R
     if rr >= 2.0:
         score += 2.0
     elif rr >= 1.5:
@@ -121,20 +106,28 @@ def calculate_score(
     elif rr >= 1.0:
         score += 0.5
 
-    # 5. Объём подтверждает (+1)
+    # Объём (+1)
     for tf in ["4H", "4h", "1D", "1d"]:
         tfa = fa.timeframes.get(tf)
         if tfa and (tfa.indicators.volume_ratio or 1.0) >= 1.3:
             score += 1.0
             break
 
-    # 6. Liquidity sweep (+1)
-    for tf_name, tfa in fa.timeframes.items():
+    # Liquidity sweep (+1)
+    for tfa in fa.timeframes.values():
         if any(liq.swept for liq in tfa.liquidity):
             score += 1.0
             break
 
-    # 7. Бонус за сильную структуру (+1)
+    # 15m подтверждение (+0.5 бонус)
+    tfa_15m = fa.timeframes.get("15m")
+    if tfa_15m:
+        if direction == "long" and tfa_15m.trend == "bullish":
+            score += 0.5
+        elif direction == "short" and tfa_15m.trend == "bearish":
+            score += 0.5
+
+    # Структура strong (+1)
     if structure.get("quality") == "strong":
         score += 1.0
 
@@ -142,65 +135,44 @@ def calculate_score(
 
 
 # ════════════════════════════════════════════════════════════
-#  ФИЛЬТР СИГНАЛОВ
+#  ФИЛЬТР
 # ════════════════════════════════════════════════════════════
 
 def filter_signals(signals: List[Signal]) -> List[Signal]:
-    """
-    Жёсткий фильтр:
-    - RR < MIN_RR_SCAN → отсев
-    - stop_pct > MAX_STOP_PCT → отсев
-    - score < MIN_SCORE_SCAN → отсев
-    """
-    result = []
-    for sig in signals:
-        if sig.rr < MIN_RR_SCAN:
-            continue
-        if sig.risk_pct > MAX_STOP_PCT:
-            continue
-        if sig.score < MIN_SCORE_SCAN:
-            continue
-        result.append(sig)
-    return result
+    return [
+        s for s in signals
+        if s.rr >= MIN_RR_SCAN
+        and s.risk_pct <= MAX_STOP_PCT
+        and s.score >= MIN_SCORE_SCAN
+    ]
 
-
-# ════════════════════════════════════════════════════════════
-#  ВЫБОР ЛУЧШЕГО СИГНАЛА
-# ════════════════════════════════════════════════════════════
 
 def select_best_signal(signals: List[Signal]) -> Optional[Signal]:
-    """
-    Сортировка по (score DESC, rr DESC) → возвращает 1 лучший.
-    """
     if not signals:
         return None
-    signals.sort(key=lambda s: (s.score, s.rr), reverse=True)
-    return signals[0]
+    return sorted(signals, key=lambda s: (s.score, s.rr), reverse=True)[0]
 
 
 # ════════════════════════════════════════════════════════════
-#  ГЕНЕРАЦИЯ СИГНАЛА ИЗ FullAnalysis
+#  ГЕНЕРАЦИЯ СИГНАЛА
 # ════════════════════════════════════════════════════════════
 
 def _generate_signal(fa: FullAnalysis) -> Optional[Signal]:
     if not fa or not fa.timeframes or fa.current_price <= 0:
         return None
-
     try:
         phase, _  = _determine_phase(fa)
         structure = _determine_structure(fa)
         levels    = _get_key_levels(fa)
         strategy  = select_strategy(fa, phase)
 
-        # Строим сценарии с учётом стратегии
-        from report_generator import _build_scenarios
+        if not strategy.signal_allowed:
+            return None
+
         scenarios = _build_scenarios(fa, structure, levels, phase, strategy)
         direction = scenarios["priority"]
 
         if direction not in ("long", "short"):
-            return None
-
-        if not strategy.signal_allowed:
             return None
 
         if direction == "long":
@@ -212,7 +184,7 @@ def _generate_signal(fa: FullAnalysis) -> Optional[Signal]:
             tgt_str    = scenarios["short_target"]
             stop_str   = scenarios["short_stop"]
 
-        if not condition or not tgt_str or not stop_str:
+        if not all([condition, tgt_str, stop_str]):
             return None
 
         entry  = fa.current_price
@@ -221,7 +193,6 @@ def _generate_signal(fa: FullAnalysis) -> Optional[Signal]:
 
         if target <= 0 or stop <= 0:
             return None
-
         if direction == "long"  and not (stop < entry < target):
             return None
         if direction == "short" and not (target < entry < stop):
@@ -239,71 +210,45 @@ def _generate_signal(fa: FullAnalysis) -> Optional[Signal]:
         if rr < 1.0:
             return None
 
-        score = calculate_score(fa, direction, phase, structure, levels, rr)
-
+        score  = calculate_score(fa, direction, phase, structure, levels, rr)
         now    = datetime.now(TZ)
         sig_id = f"{fa.symbol}_{now.strftime('%Y%m%d_%H%M')}"
 
         return Signal(
-            id=sig_id,
-            symbol=fa.symbol,
-            asset_type=fa.asset_type,
-            direction=direction,
-            entry_price=entry,
-            target_price=target,
-            stop_price=stop,
-            rr=rr,
-            reward_pct=reward_pct,
-            risk_pct=risk_pct,
-            phase=phase,
-            bias=structure["bias"],
-            strategy=strategy.name,
-            condition=condition,
-            score=score,
-            created_at=now.isoformat(),
+            id=sig_id, symbol=fa.symbol, asset_type=fa.asset_type,
+            direction=direction, entry_price=entry,
+            target_price=target, stop_price=stop,
+            rr=rr, reward_pct=reward_pct, risk_pct=risk_pct,
+            phase=phase, bias=structure["bias"],
+            strategy=strategy.name, condition=condition,
+            score=score, created_at=now.isoformat(),
         )
-
     except Exception as e:
         logger.error(f"_generate_signal {fa.symbol}: {e}")
         return None
 
 
 # ════════════════════════════════════════════════════════════
-#  СКАНИРОВАНИЕ РЫНКА — ГЛАВНАЯ НОВАЯ ФУНКЦИЯ
-#  Загружает ТОП-50 фьючерсов Bitget, анализирует, выбирает 1
+#  СКАН РЫНКА (ТОП-50, включая 15m)
 # ════════════════════════════════════════════════════════════
 
 async def scan_market_for_best_signal(
     progress_callback=None,
     top_n_scan: int = 50,
 ) -> Tuple[Optional[Signal], int]:
-    """
-    Сканирует топ N фьючерсов Bitget.
-    Возвращает (лучший_сигнал, количество_просканировано).
-
-    progress_callback(text) — опциональная функция для обновления статуса.
-    """
     loop = asyncio.get_event_loop()
 
-    # ── Шаг 1: загружаем список топ-N символов ──────────
     try:
         from data_fetcher import get_top_futures_by_volume
-        symbols = await loop.run_in_executor(
-            None, get_top_futures_by_volume, top_n_scan, []
-        )
+        symbols = await loop.run_in_executor(None, get_top_futures_by_volume, top_n_scan, [])
         if not symbols:
-            logger.error("scan_market: не удалось получить список символов")
             return None, 0
     except Exception as e:
-        logger.error(f"scan_market: get_top_futures_by_volume: {e}")
+        logger.error(f"scan: get_top_futures: {e}")
         return None, 0
 
     if progress_callback:
-        await progress_callback(f"📡 Загружено {len(symbols)} инструментов. Анализирую...")
-
-    # ── Шаг 2: быстрый анализ по каждому ────────────────
-    # Используем только 3 ключевых таймфрейма для скорости: 1D, 4H, 1H
-    FAST_TF = ["1D", "4H", "1H"]
+        await progress_callback(f"Загружено {len(symbols)} инструментов. Начинаю анализ...")
 
     candidates: List[Signal] = []
     scanned = 0
@@ -312,11 +257,11 @@ async def scan_market_for_best_signal(
         try:
             from data_fetcher import fetch_bitget_ohlcv
             tf_data = {}
-            for tf in FAST_TF:
+            for tf in SCAN_TIMEFRAMES:
                 df = await loop.run_in_executor(None, fetch_bitget_ohlcv, symbol, tf, 100)
                 if df is not None and not df.empty:
                     tf_data[tf] = df
-                await asyncio.sleep(0.05)  # rate limit
+                await asyncio.sleep(0.05)
 
             if len(tf_data) < 2:
                 continue
@@ -333,40 +278,32 @@ async def scan_market_for_best_signal(
 
             scanned += 1
 
-            # Обновляем прогресс каждые 10 монет
             if progress_callback and (i + 1) % 10 == 0:
                 await progress_callback(
-                    f"🔍 Проверено {i+1}/{len(symbols)}... "
-                    f"Найдено кандидатов: {len(candidates)}"
+                    f"Проверено {i+1}/{len(symbols)}  ·  "
+                    f"Кандидатов: {len(candidates)}"
                 )
 
         except Exception as e:
             logger.debug(f"scan {symbol}: {e}")
             continue
 
-    # ── Шаг 3: фильтр + выбор лучшего ──────────────────
-    filtered  = filter_signals(candidates)
-    best      = select_best_signal(filtered)
+    filtered = filter_signals(candidates)
+    best     = select_best_signal(filtered)
 
     if progress_callback:
         await progress_callback(
-            f"✅ Готово. Просканировано: {scanned}. "
-            f"Прошли фильтр: {len(filtered)}."
+            f"Готово. Просканировано: {scanned}  ·  Прошли фильтр: {len(filtered)}"
         )
 
     return best, scanned
 
 
 # ════════════════════════════════════════════════════════════
-#  AI КОММЕНТАРИЙ (Claude API)
+#  AI КОММЕНТАРИЙ
 # ════════════════════════════════════════════════════════════
 
 async def get_ai_comment(sig: Signal) -> str:
-    """
-    Отправляет данные сигнала в Claude API.
-    Возвращает 1-2 строки профессионального комментария.
-    Если API недоступен — возвращает "".
-    """
     try:
         import os
         api_key = os.getenv("ANTHROPIC_API_KEY", "")
@@ -374,23 +311,17 @@ async def get_ai_comment(sig: Signal) -> str:
             return ""
 
         import aiohttp
-
         direction_ru = "лонг" if sig.direction == "long" else "шорт"
+
         prompt = (
-            f"Ты профессиональный трейдер проп-компании. Дай краткий комментарий (1-2 строки) "
-            f"к торговому сигналу. Стиль: уверенный, конкретный, без воды.\n\n"
-            f"Сигнал:\n"
-            f"Инструмент: {sig.symbol}\n"
-            f"Направление: {direction_ru.upper()}\n"
-            f"Стратегия: {sig.strategy}\n"
-            f"Фаза рынка: {sig.phase}\n"
-            f"Структурный bias: {sig.bias}\n"
-            f"Вход: {sig.entry_price}\n"
-            f"Цель: {sig.target_price} (+{sig.reward_pct}%)\n"
-            f"Стоп: {sig.stop_price} (-{sig.risk_pct}%)\n"
-            f"R:R: {sig.rr}\n"
-            f"Условие: {sig.condition}\n\n"
-            f"Ответь одним абзацем, 1-2 предложения. Не используй emoji."
+            f"Ты профессиональный трейдер проп-компании. "
+            f"Дай краткий комментарий (1-2 предложения) к сигналу. "
+            f"Стиль: уверенно, конкретно, без воды, без emoji.\n\n"
+            f"Сигнал: {sig.symbol} {direction_ru.upper()} | "
+            f"Стратегия: {sig.strategy} | Фаза: {sig.phase} | "
+            f"Вход: {sig.entry_price} | Цель: {sig.target_price} (+{sig.reward_pct}%) | "
+            f"Стоп: {sig.stop_price} (-{sig.risk_pct}%) | R:R: {sig.rr}\n"
+            f"Условие: {sig.condition}"
         )
 
         async with aiohttp.ClientSession() as session:
@@ -410,15 +341,14 @@ async def get_ai_comment(sig: Signal) -> str:
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    text = data["content"][0]["text"].strip()
-                    return text
+                    return data["content"][0]["text"].strip()
     except Exception as e:
         logger.debug(f"get_ai_comment: {e}")
     return ""
 
 
 # ════════════════════════════════════════════════════════════
-#  ИСТОРИЯ — сохранение, загрузка, дедупликация
+#  ИСТОРИЯ СИГНАЛОВ
 # ════════════════════════════════════════════════════════════
 
 def _load_history() -> Dict:
@@ -431,86 +361,72 @@ def _load_history() -> Dict:
 
 
 def _has_active_duplicate(history: Dict, symbol: str, direction: str) -> bool:
-    """FIX 1.2: блокирует дубли — активный сигнал по symbol+direction."""
-    for sig_data in history.values():
-        if (sig_data.get("symbol") == symbol and
-                sig_data.get("direction") == direction and
-                sig_data.get("status") == "active"):
-            return True
-    return False
+    """Блокирует дубли: активный сигнал по symbol+direction."""
+    return any(
+        v.get("symbol") == symbol and
+        v.get("direction") == direction and
+        v.get("status") == "active"
+        for v in history.values()
+    )
 
 
 def save_signals(signals: List[Signal]):
-    """Сохраняет сигналы, пропускает дубли."""
     try:
         history = _load_history()
-        saved = 0
         for sig in signals:
-            # FIX 1.2: не сохраняем если уже есть активный по symbol+direction
             if _has_active_duplicate(history, sig.symbol, sig.direction):
                 logger.info(f"Дубль пропущен: {sig.symbol} {sig.direction}")
                 continue
             history[sig.id] = asdict(sig)
-            saved += 1
-        if saved:
-            SIGNALS_FILE.write_text(json.dumps(history, ensure_ascii=False, indent=2))
+        SIGNALS_FILE.write_text(json.dumps(history, ensure_ascii=False, indent=2))
     except Exception as e:
         logger.error(f"save_signals: {e}")
 
 
 def update_signal_status(symbol: str, current_price: float):
-    """
-    FIX 1.1: PnL считается от stop_price / target_price, не от current_price.
-    """
+    """FIX: PnL считается от stop/target price, не от current."""
     try:
         history = _load_history()
         changed = False
-
-        for sig_id, sig_data in history.items():
-            if sig_data["symbol"] != symbol:
-                continue
-            if sig_data["status"] != "active":
+        for sig_data in history.values():
+            if sig_data["symbol"] != symbol or sig_data["status"] != "active":
                 continue
 
-            entry     = sig_data["entry_price"]
-            target    = sig_data["target_price"]
-            stop      = sig_data["stop_price"]
+            entry, target, stop = (
+                sig_data["entry_price"],
+                sig_data["target_price"],
+                sig_data["stop_price"],
+            )
             direction = sig_data["direction"]
-            now       = datetime.now(TZ).isoformat()
+            now = datetime.now(TZ).isoformat()
 
             if direction == "long":
                 if current_price >= target:
-                    sig_data["status"]    = "hit_target"
-                    sig_data["closed_at"] = now
-                    # FIX: от target_price, не от current
+                    sig_data["status"]     = "hit_target"
+                    sig_data["closed_at"]  = now
                     sig_data["result_pct"] = round((target - entry) / entry * 100, 2)
                     changed = True
                 elif current_price <= stop:
-                    sig_data["status"]    = "hit_stop"
-                    sig_data["closed_at"] = now
-                    # FIX: от stop_price, не от current
+                    sig_data["status"]     = "hit_stop"
+                    sig_data["closed_at"]  = now
                     sig_data["result_pct"] = round((stop - entry) / entry * 100, 2)
                     changed = True
-            else:  # short
+            else:
                 if current_price <= target:
-                    sig_data["status"]    = "hit_target"
-                    sig_data["closed_at"] = now
+                    sig_data["status"]     = "hit_target"
+                    sig_data["closed_at"]  = now
                     sig_data["result_pct"] = round((entry - target) / entry * 100, 2)
                     changed = True
                 elif current_price >= stop:
-                    sig_data["status"]    = "hit_stop"
-                    sig_data["closed_at"] = now
+                    sig_data["status"]     = "hit_stop"
+                    sig_data["closed_at"]  = now
                     sig_data["result_pct"] = round((entry - stop) / entry * 100, 2)
                     changed = True
 
         if changed:
             SIGNALS_FILE.write_text(json.dumps(history, ensure_ascii=False, indent=2))
-            return {k: v for k, v in history.items()
-                    if v["symbol"] == symbol and v["status"] != "active"}
-
     except Exception as e:
         logger.error(f"update_signal_status: {e}")
-    return {}
 
 
 # ════════════════════════════════════════════════════════════
@@ -518,28 +434,18 @@ def update_signal_status(symbol: str, current_price: float):
 # ════════════════════════════════════════════════════════════
 
 def format_signal(sig: Signal, ai_comment: str = "") -> str:
-    """
-    Чистый формат сигнала момента.
-    Стиль: трейдер, не бот.
-    """
-    dir_icon = "🟢" if sig.direction == "long" else "🔴"
-    dir_ru   = "LONG" if sig.direction == "long" else "SHORT"
-
-    score_filled = int(sig.score / 10 * 8)
-    score_bar    = "█" * score_filled + "░" * (8 - score_filled)
-
-    entry_s  = _fmt_price(sig.entry_price,  sig.symbol)
-    target_s = _fmt_price(sig.target_price, sig.symbol)
-    stop_s   = _fmt_price(sig.stop_price,   sig.symbol)
+    d_icon = "🟢" if sig.direction == "long" else "🔴"
+    d_ru   = "LONG" if sig.direction == "long" else "SHORT"
+    bars   = "█" * int(sig.score / 10 * 8) + "░" * (8 - int(sig.score / 10 * 8))
 
     lines = [
         f"🎯 *СИГНАЛ МОМЕНТА*",
         f"",
-        f"{dir_icon} *{sig.symbol}  —  {dir_ru}*",
+        f"{d_icon} *{sig.symbol}  —  {d_ru}*",
         f"",
-        f"Вход:    `{entry_s}`",
-        f"Стоп:    `{stop_s}`  _(-{sig.risk_pct}%)_",
-        f"Тейк:    `{target_s}`  _(+{sig.reward_pct}%)_",
+        f"Вход:    `{_fmt_price(sig.entry_price,  sig.symbol)}`",
+        f"Стоп:    `{_fmt_price(sig.stop_price,   sig.symbol)}`  _(-{sig.risk_pct}%)_",
+        f"Тейк:    `{_fmt_price(sig.target_price, sig.symbol)}`  _(+{sig.reward_pct}%)_",
         f"",
         f"R:R:     *{sig.rr}*",
         f"Сетап:   _{sig.strategy}_",
@@ -549,17 +455,15 @@ def format_signal(sig: Signal, ai_comment: str = "") -> str:
     ]
 
     if ai_comment:
-        lines.append("")
-        lines.append(f"💬 _{ai_comment}_")
+        lines += ["", f"💬 _{ai_comment}_"]
 
     lines += [
         f"",
-        f"Качество: *{sig.score}/10*  `{score_bar}`",
+        f"Качество: *{sig.score}/10*  `{bars}`",
         f"",
         f"{'─' * 28}",
-        f"_⚠️ Не финансовый совет. Управляй риском._",
+        f"_⚠️ Не финансовый совет. Управляй риском самостоятельно._",
     ]
-
     return "\n".join(lines)
 
 
@@ -567,7 +471,7 @@ def format_no_signal(scanned: int) -> str:
     return (
         f"🎯 *СИГНАЛ МОМЕНТА*\n\n"
         f"Просканировано: {scanned} инструментов\n\n"
-        f"Сегодня нет сигналов, прошедших фильтр:\n"
+        f"Сигналов, прошедших фильтр, нет:\n"
         f"  · R:R ≥ {MIN_RR_SCAN}\n"
         f"  · Стоп ≤ {MAX_STOP_PCT}%\n"
         f"  · Качество ≥ {MIN_SCORE_SCAN}/10\n\n"
@@ -576,7 +480,7 @@ def format_no_signal(scanned: int) -> str:
 
 
 # ════════════════════════════════════════════════════════════
-#  ОБРАТНАЯ СОВМЕСТИМОСТЬ — get_best_signals (для /report)
+#  ОБРАТНАЯ СОВМЕСТИМОСТЬ
 # ════════════════════════════════════════════════════════════
 
 def get_best_signals(
@@ -585,14 +489,13 @@ def get_best_signals(
     min_score: float = MIN_SCORE_SCAN,
 ) -> List[Signal]:
     signals = []
-    for symbol, fa in active_analyses.items():
+    for fa in active_analyses.values():
         sig = _generate_signal(fa)
         if sig and sig.score >= min_score:
             signals.append(sig)
 
     signals.sort(key=lambda s: (s.score, s.rr), reverse=True)
 
-    # Дедупликация: не два сигнала в одну сторону одного класса
     result, seen = [], set()
     for sig in signals:
         key = f"{sig.asset_type}_{sig.direction}"
@@ -601,22 +504,18 @@ def get_best_signals(
             seen.add(key)
         if len(result) >= top_n:
             break
-
     return result
 
 
 # ════════════════════════════════════════════════════════════
-#  РАСШИРЕННАЯ СТАТИСТИКА
+#  СТАТИСТИКА
 # ════════════════════════════════════════════════════════════
 
 def get_stats_text() -> str:
     try:
         history = _load_history()
         if not history:
-            return (
-                "📊 *Статистика сигналов*\n\n"
-                "История пуста.\nНажми *🎯 Сигнал дня* чтобы начать."
-            )
+            return "📊 *Статистика*\n\nИстория пуста.\nНажми *🎯 Сигнал дня* чтобы начать."
 
         all_sigs = list(history.values())
         total    = len(all_sigs)
@@ -625,52 +524,36 @@ def get_stats_text() -> str:
         wins     = [s for s in closed   if s["status"] == "hit_target"]
         losses   = [s for s in closed   if s["status"] == "hit_stop"]
 
-        winrate  = round(len(wins) / len(closed) * 100) if closed else 0
-        avg_win  = round(sum(s["result_pct"] for s in wins)   / len(wins),   2) if wins   else 0.0
-        avg_loss = round(sum(s["result_pct"] for s in losses) / len(losses), 2) if losses else 0.0
-
-        # FIX 1.3: avg_rr только по закрытым
+        winrate       = round(len(wins) / len(closed) * 100) if closed else 0
+        avg_win       = round(sum(s["result_pct"] for s in wins)   / len(wins),   2) if wins   else 0.0
+        avg_loss      = round(sum(s["result_pct"] for s in losses) / len(losses), 2) if losses else 0.0
         avg_rr_closed = round(sum(s["rr"] for s in closed) / len(closed), 2) if closed else 0.0
-        avg_rr_total  = round(sum(s["rr"] for s in all_sigs) / total, 2) if total else 0.0
 
-        # Максимальная просадка (серия убытков)
-        max_drawdown = _calc_max_drawdown(closed)
+        max_dd               = _calc_max_drawdown(closed)
+        win_streak, loss_str = _calc_streaks(closed)
 
-        # Серия побед / поражений
-        win_streak, loss_streak = _calc_streaks(closed)
-
-        # Последние 5 закрытых
         last5 = sorted(closed, key=lambda x: x.get("closed_at", ""), reverse=True)[:5]
-        last5_lines = []
-        for s in last5:
-            icon = "✅" if s["status"] == "hit_target" else "❌"
-            sign = "+" if s["result_pct"] >= 0 else ""
-            last5_lines.append(
-                f"  {icon} {s['symbol']} {s['direction'].upper()} "
-                f"{sign}{s['result_pct']}%"
-            )
+        last5_lines = [
+            f"  {'✅' if s['status'] == 'hit_target' else '❌'} "
+            f"{s['symbol']} {s['direction'].upper()} "
+            f"{'+' if s['result_pct'] >= 0 else ''}{s['result_pct']}%"
+            for s in last5
+        ]
 
         lines = [
-            "📊 *Статистика сигналов*",
-            "",
-            f"Всего: {total}  ·  Активных: {len(active)}  ·  Закрытых: {len(closed)}",
-            "",
+            "📊 *Статистика сигналов*", "",
+            f"Всего: {total}  ·  Активных: {len(active)}  ·  Закрытых: {len(closed)}", "",
             f"✅ Целей: {len(wins)}  ·  ❌ Стопов: {len(losses)}",
-            f"Винрейт: *{winrate}%*",
-            "",
+            f"Винрейт: *{winrate}%*", "",
             f"Средний выигрыш:  *+{avg_win}%*",
             f"Средний убыток:   *{avg_loss}%*",
-            f"Средний R:R (закрытые): *{avg_rr_closed}*",
-            "",
-            f"Max просадка серией: *{max_drawdown:.1f}%*",
-            f"Серия побед:    {win_streak}",
-            f"Серия поражений: {loss_streak}",
+            f"Средний R:R (закрытые): *{avg_rr_closed}*", "",
+            f"Max просадка: *{max_dd:.1f}%*",
+            f"Серия побед: {win_streak}  ·  Серия поражений: {loss_str}",
         ]
 
         if last5_lines:
-            lines.append("")
-            lines.append("*Последние закрытые:*")
-            lines.extend(last5_lines)
+            lines += ["", "*Последние закрытые:*"] + last5_lines
 
         return "\n".join(lines)
 
@@ -680,39 +563,34 @@ def get_stats_text() -> str:
 
 
 def _calc_max_drawdown(closed: List[Dict]) -> float:
-    """Максимальная кумулятивная просадка по закрытым сигналам."""
     if not closed:
         return 0.0
-    sorted_c = sorted(closed, key=lambda x: x.get("closed_at", ""))
-    cumulative = 0.0
-    peak       = 0.0
-    max_dd     = 0.0
+    sorted_c   = sorted(closed, key=lambda x: x.get("closed_at", ""))
+    cum, peak, max_dd = 0.0, 0.0, 0.0
     for s in sorted_c:
-        cumulative += s["result_pct"]
-        if cumulative > peak:
-            peak = cumulative
-        dd = peak - cumulative
+        cum += s["result_pct"]
+        if cum > peak:
+            peak = cum
+        dd = peak - cum
         if dd > max_dd:
             max_dd = dd
     return round(max_dd, 2)
 
 
 def _calc_streaks(closed: List[Dict]) -> Tuple[int, int]:
-    """Текущая серия побед и поражений."""
     if not closed:
         return 0, 0
     sorted_c = sorted(closed, key=lambda x: x.get("closed_at", ""), reverse=True)
-    win_streak  = 0
-    loss_streak = 0
+    win_s = loss_s = 0
     for s in sorted_c:
         if s["status"] == "hit_target":
-            if loss_streak == 0:
-                win_streak += 1
+            if loss_s == 0:
+                win_s += 1
             else:
                 break
         else:
-            if win_streak == 0:
-                loss_streak += 1
+            if win_s == 0:
+                loss_s += 1
             else:
                 break
-    return win_streak, loss_streak
+    return win_s, loss_s
